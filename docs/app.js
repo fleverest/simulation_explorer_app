@@ -55,6 +55,7 @@ const state = {
   trim: true,
   logWeights: false,
   llWindow: 340,
+  llZoom: true,
   hover: null
 };
 
@@ -854,8 +855,9 @@ function renderLikelihood(rec) {
   const floor = maxLL - state.llWindow;
   const zc = Float64Array.from(z, v => Math.max(v, floor));
 
-  drawLLSurface(zc, { maxLL, floor, maxI1, maxI2 });
-  drawLLProfiles(z, { maxLL, floor, maxI1, maxI2 });
+  const dom = (state.llZoom ? llExtent(zc, floor) : null) || llFullExtent();
+  drawLLSurface(zc, { maxLL, floor, maxI1, maxI2, dom });
+  drawLLProfiles(z, { maxLL, floor, maxI1, maxI2, dom });
 
   const llTrue = bilinear(z, meta.beta_true.b0, meta.beta_true.b1);
   d3.select("#llReadout").html(
@@ -867,6 +869,43 @@ function renderLikelihood(rec) {
       `<span class="sep">|</span><span class="dim">difference</span> ${f1(maxLL - llTrue)}`)
   );
 }
+
+/* The theta grid is deliberately wide and most of it is -Inf, so at any useful
+   window the surface is a small blob adrift in a lot of nothing. This is the
+   bounding box of the cells that clear the floor, widened by one cell so the
+   outermost contour closes inside the frame, and always containing the true
+   parameter -- the distance from it is the thing the view is for, and a truth
+   marker off the edge would answer that question with silence. */
+function llExtent(zc, floor) {
+  let a1 = n1, b1 = -1, a2 = n2, b2 = -1;
+  for (let i2 = 0; i2 < n2; i2++)
+    for (let i1 = 0; i1 < n1; i1++)
+      if (zc[i2 * n1 + i1] > floor) {
+        if (i1 < a1) a1 = i1;
+        if (i1 > b1) b1 = i1;
+        if (i2 < a2) a2 = i2;
+        if (i2 > b2) b2 = i2;
+      }
+  if (b1 < 0) return null;                        // a flat surface: nothing to zoom to
+
+  const grow = (lo, hi, truth, cell) => {
+    lo = Math.min(lo, truth);
+    hi = Math.max(hi, truth);
+    const p = Math.max((hi - lo) * 0.06, cell);
+    return [lo - p, hi + p];
+  };
+  return {
+    t1: grow(meta.th1[Math.max(0, a1 - 1)], meta.th1[Math.min(n1 - 1, b1 + 1)],
+             meta.beta_true.b0, d1),
+    t2: grow(meta.th2[Math.max(0, a2 - 1)], meta.th2[Math.min(n2 - 1, b2 + 1)],
+             meta.beta_true.b1, d2)
+  };
+}
+
+const llFullExtent = () => ({
+  t1: [meta.th1[0], meta.th1[n1 - 1]],
+  t2: [meta.th2[0], meta.th2[n2 - 1]]
+});
 
 /* Bilinear read of the surface at an arbitrary (th1, th2), for the truth
    marker and for the hover readout; the grid is evenly spaced in both. */
@@ -886,10 +925,10 @@ function bilinear(z, t1, t2) {
 function drawLLSurface(zc, info) {
   const W = 640, H = 470, m = { l: 54, r: 16, t: 12, b: 44 };
   const svg = frame("#llSurface", W, H);
-  const xs = d3.scaleLinear([meta.th1[0], meta.th1[n1 - 1]], [m.l, W - m.r]);
-  const ys = d3.scaleLinear([meta.th2[0], meta.th2[n2 - 1]], [H - m.b, m.t]);
+  const xs = d3.scaleLinear(info.dom.t1, [m.l, W - m.r]);
+  const ys = d3.scaleLinear(info.dom.t2, [H - m.b, m.t]);
 
-  const levels = d3.ticks(info.floor, info.maxLL, 11).filter(v => v > info.floor);
+  const levels = d3.ticks(info.floor, info.maxLL, 6).filter(v => v > info.floor);
   const contours = d3.contours().size([n1, n2]).thresholds(levels)(zc);
 
   // Contour coordinates arrive in grid-index units.
@@ -922,9 +961,10 @@ function drawLLSurface(zc, info) {
     .attr("stroke-width", 0.8);
 
   const anchorX = xs(meta.th1[info.maxI1]), anchorY = ys(meta.th2[info.maxI2]);
-  labelContours(plot, contours, xs, ys, anchorX, anchorY);
-
   const truth = [meta.beta_true.b0, meta.beta_true.b1];
+  labelContours(plot, contours, xs, ys, anchorX, anchorY,
+                [[anchorX, anchorY], [xs(truth[0]), ys(truth[1])]]);
+
   const mark = (cx, cy, colour, text, dy) => {
     plot.append("circle").attr("cx", cx).attr("cy", cy)
       .attr("r", 4.6).attr("fill", colour)
@@ -980,7 +1020,7 @@ function drawLLSurface(zc, info) {
    increasing distance. Horizontal text with a halo: at such a crossing the
    contour is close to vertical, so rotating to the tangent is the worst
    possible angle. */
-function labelContours(g, contours, xs, ys, x0, y0) {
+function labelContours(g, contours, xs, ys, x0, y0, avoid = []) {
   const layer = g.append("g");
   const px = ([gx, gy]) => [xs(meta.th1[0] + gx * d1), ys(meta.th2[0] + gy * d2)];
   const lo = xs.range()[0], hi = xs.range()[1];
@@ -995,12 +1035,16 @@ function labelContours(g, contours, xs, ys, x0, y0) {
         if ((a[1] - y0) * (b[1] - y0) > 0) continue;      // no crossing
         const dy = b[1] - a[1];
         const x = dy === 0 ? a[0] : a[0] + ((y0 - a[1]) / dy) * (b[0] - a[0]);
-        if (dir * (x - x0) < 8) continue;                 // on the wrong side
+        if (dir * (x - x0) < 30) continue;                // on the wrong side
         if (best == null || dir * (x - best) < 0) best = x;
       }
     }));
     if (best == null || best < lo + 14 || best > hi - 14) return;
     if (placed.some(x => Math.abs(x - best) < 30)) return;
+    // The ray runs through the maximum, and the true parameter often sits on it
+    // too; a level printed over either marker hides the thing it is measured
+    // against.
+    if (avoid.some(([ax, ay]) => Math.abs(ay - y0) < 12 && Math.abs(ax - best) < 30)) return;
     placed.push(best);
 
     layer.append("text")
@@ -1025,6 +1069,7 @@ function drawLLProfiles(z, info) {
       axis: meta.th1,
       v: d3.range(n1).map(i => Math.max(z[info.maxI2 * n1 + i], info.floor)),
       truth: meta.beta_true.b0,
+      dom: info.dom.t1,
       at: info.maxI1
     },
     {
@@ -1032,13 +1077,14 @@ function drawLLProfiles(z, info) {
       axis: meta.th2,
       v: d3.range(n2).map(j => Math.max(z[j * n1 + info.maxI1], info.floor)),
       truth: meta.beta_true.b1,
+      dom: info.dom.t2,
       at: info.maxI2
     }
   ];
 
   panels.forEach((p, r) => {
     const g = svg.append("g").attr("transform", `translate(0,${r * (H + gap)})`);
-    const xs = d3.scaleLinear(d3.extent(p.axis), [m.l, W - m.r]);
+    const xs = d3.scaleLinear(p.dom, [m.l, W - m.r]);
     // Clipped at the same window as the contours, so the two panels agree about
     // what counts as "near the peak".
     const ys = d3.scaleLinear([info.floor, info.maxLL], [H - m.b, m.t]).nice();
@@ -1167,6 +1213,7 @@ function buildKnobs() {
     .attr("step", 20).property("value", state.llWindow)
     .on("input", function () { state.llWindow = +this.value; render(); });
   lc.append("span").attr("class", "val").attr("id", "llWindowVal").text(state.llWindow);
+  checkbox(lk, "zoom to the surface", () => state.llZoom, v => state.llZoom = v);
 }
 
 function syncKnobs() {
